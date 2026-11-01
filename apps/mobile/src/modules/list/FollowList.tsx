@@ -1,0 +1,285 @@
+import { FeedViewType, UserRole } from "@follow/constants"
+import { useListById } from "@follow/store/list/hooks"
+import { listSyncServices } from "@follow/store/list/store"
+import { useSubscriptionByListId } from "@follow/store/subscription/hooks"
+import { subscriptionSyncService } from "@follow/store/subscription/store"
+import { whoami } from "@follow/store/user/getters"
+import { useUserRole } from "@follow/store/user/hooks"
+import { zodResolver } from "@hookform/resolvers/zod"
+import { useQuery } from "@tanstack/react-query"
+import { useEffect, useMemo, useState } from "react"
+import { Controller, useForm } from "react-hook-form"
+import { useTranslation } from "react-i18next"
+import { StyleSheet, View } from "react-native"
+import { z } from "zod"
+
+import { useIsPaymentEnabled } from "@/src/atoms/server-configs"
+import { ListErrorView } from "@/src/components/errors/ListErrorView"
+import { HeaderSubmitTextButton } from "@/src/components/layouts/header/HeaderElements"
+import {
+  NavigationBlurEffectHeaderView,
+  SafeNavigationScrollView,
+} from "@/src/components/layouts/views/SafeNavigationScrollView"
+import { PaidBadge } from "@/src/components/ui/badge/PaidBadge"
+import { FormProvider } from "@/src/components/ui/form/FormProvider"
+import { FormLabel } from "@/src/components/ui/form/Label"
+import { FormSwitch } from "@/src/components/ui/form/Switch"
+import { TextField } from "@/src/components/ui/form/TextField"
+import { GroupedInsetListCard } from "@/src/components/ui/grouped/GroupedList"
+import { IconWithFallback } from "@/src/components/ui/icon/fallback-icon"
+import { PlatformActivityIndicator } from "@/src/components/ui/loading/PlatformActivityIndicator"
+import { Text } from "@/src/components/ui/typography/Text"
+import { isNotFoundError, toastFetchError } from "@/src/lib/error-parser"
+import { destination } from "@/src/lib/navigation/biz/Destination"
+import { useNavigation, useScreenIsInSheetModal } from "@/src/lib/navigation/hooks"
+import { useSetModalScreenOptions } from "@/src/lib/navigation/ScreenOptionsContext"
+import { toast } from "@/src/lib/toast"
+
+import { FollowStateView } from "../feed/FollowStateView"
+import { FeedViewSelector } from "../feed/view-selector"
+
+export const FollowList = (props: { id: string }) => {
+  const { id } = props
+  const { t } = useTranslation()
+  const list = useListById(id)
+  const { isFetching, error, refetch } = useQuery({
+    queryKey: ["list", id],
+    queryFn: () =>
+      listSyncServices.fetchListById({
+        id,
+      }),
+    enabled: !list,
+  })
+  if (!list) {
+    if (isFetching) {
+      return (
+        <FollowStateView>
+          <View className="mt-24 flex-1 flex-row items-start justify-center">
+            <PlatformActivityIndicator />
+          </View>
+        </FollowStateView>
+      )
+    }
+    if (error && !isNotFoundError(error)) {
+      return (
+        <FollowStateView>
+          <ListErrorView error={error} resetError={() => void refetch()} />
+        </FollowStateView>
+      )
+    }
+    // Also for a list the server does not have, which no retry would find
+    return (
+      <FollowStateView>
+        <Text className="mt-24 px-4 text-center text-label">{t("list.not_found", { id })}</Text>
+      </FollowStateView>
+    )
+  }
+  return <Impl id={id} />
+}
+const formSchema = z.object({
+  view: z.number(),
+  isPrivate: z.boolean(),
+  hideFromTimeline: z.boolean().optional(),
+  title: z.string().optional(),
+})
+const Impl = (props: { id: string }) => {
+  const { t } = useTranslation()
+  const { t: tCommon } = useTranslation("common")
+  const { id } = props
+  const list = useListById(id)
+  const subscription = useSubscriptionByListId(id)
+  const isSubscribed = !!subscription
+  // Private follow and hiding from the timeline are paid features for lists, as on desktop. Only
+  // turning one on needs the plan, so a list that has it on after a downgrade can still turn it off.
+  const role = useUserRole()
+  const isPaymentEnabled = useIsPaymentEnabled()
+  const isPlanLocked = isPaymentEnabled && (role === UserRole.Free || role === UserRole.Trial)
+  const defaultFormValues = useMemo(
+    () => ({
+      view: list?.view ?? FeedViewType.Articles,
+      isPrivate: subscription?.isPrivate ?? false,
+      hideFromTimeline: subscription?.hideFromTimeline ?? undefined,
+      title: subscription?.title ?? undefined,
+    }),
+    [list?.view, subscription],
+  )
+  const form = useForm<z.infer<typeof formSchema>>({
+    resolver: zodResolver(formSchema),
+    defaultValues: defaultFormValues,
+  })
+  // The fields the user left alone follow edits that arrive from other devices, so saving
+  // does not write their old values back.
+  useEffect(() => {
+    form.reset(defaultFormValues, { keepDirtyValues: true })
+  }, [defaultFormValues, form])
+  const { isValid, isDirty } = form.formState
+  const isModal = useScreenIsInSheetModal()
+  const navigation = useNavigation()
+  const [isLoading, setIsLoading] = useState(false)
+  const submit = async () => {
+    if (!list) return
+    if (isLoading) return
+    // A link can open the form signed out; the form stays for after the sign-in
+    if (!whoami()) {
+      destination.Login()
+      return
+    }
+    setIsLoading(true)
+    const payload = form.getValues()
+    try {
+      const body = {
+        listId: list.id,
+        view: list.view,
+        isPrivate: payload.isPrivate,
+        title: payload.title,
+        hideFromTimeline: payload.hideFromTimeline,
+        url: undefined,
+        category: undefined,
+        feedId: undefined,
+      }
+      if (isSubscribed) {
+        await subscriptionSyncService.edit({
+          ...subscription,
+          ...body,
+        })
+      } else {
+        await subscriptionSyncService.subscribe(body)
+      }
+      toast.success(isSubscribed ? "List updated" : "List followed")
+      if (isModal) {
+        navigation.dismiss()
+      } else {
+        navigation.back()
+      }
+    } catch (error) {
+      toastFetchError(error as Error)
+    } finally {
+      setIsLoading(false)
+    }
+  }
+  const setModalOptions = useSetModalScreenOptions()
+  useEffect(() => {
+    setModalOptions({
+      preventNativeDismiss: isDirty,
+    })
+  }, [isDirty, setModalOptions])
+  if (!list) {
+    return null
+  }
+  return (
+    <SafeNavigationScrollView
+      className="bg-system-grouped-background"
+      contentViewClassName="gap-y-4 mt-2"
+      Header={
+        <NavigationBlurEffectHeaderView
+          title={`${isSubscribed ? tCommon("words.edit") : tCommon("words.follow")} - ${list?.title}`}
+          promptBeforeLeave={isDirty}
+          headerRight={
+            <HeaderSubmitTextButton
+              isValid={isValid}
+              onPress={form.handleSubmit(submit)}
+              isLoading={isLoading}
+              label={isSubscribed ? tCommon("words.save") : tCommon("words.follow")}
+            />
+          }
+        />
+      }
+    >
+      <GroupedInsetListCard className="px-5 py-4">
+        <View className="flex flex-row gap-4">
+          <View className="size-[50px] overflow-hidden rounded-lg">
+            <IconWithFallback
+              url={list?.image}
+              title={list?.title}
+              size={50}
+              textClassName="font-semibold"
+              textStyle={styles.title}
+            />
+          </View>
+          <View className="flex-1 flex-col gap-y-1">
+            <Text className="text-lg font-semibold text-text">{list?.title}</Text>
+            <Text className="text-sm text-secondary-label">{list?.description}</Text>
+          </View>
+        </View>
+      </GroupedInsetListCard>
+
+      <GroupedInsetListCard className="gap-y-6 px-5 py-4">
+        <FormProvider form={form}>
+          <View className="-mx-4">
+            <FormLabel className="mb-4 pl-4" label={t("subscription_form.view")} optional />
+
+            <FeedViewSelector readOnly value={list.view} />
+          </View>
+
+          <View className="-mx-2.5">
+            <Controller
+              name="title"
+              control={form.control}
+              render={({ field: { onChange, ref, value } }) => (
+                <TextField
+                  label={t("subscription_form.title")}
+                  description={t("subscription_form.list_title_description")}
+                  onChangeText={onChange}
+                  value={value}
+                  ref={ref}
+                  wrapperClassName="ml-2.5"
+                />
+              )}
+            />
+          </View>
+
+          <View className="-mx-1">
+            <Controller
+              name="isPrivate"
+              control={form.control}
+              render={({ field: { onChange, value } }) => (
+                <FormSwitch
+                  value={value}
+                  label={t("subscription_form.private_follow")}
+                  labelAccessory={
+                    <PaidBadge
+                      feature={t("subscription_form.private_follow")}
+                      locked={isPlanLocked}
+                    />
+                  }
+                  description={t("subscription_form.private_follow_description")}
+                  onValueChange={onChange}
+                  disabled={isPlanLocked && subscription?.isPrivate !== true}
+                  size="sm"
+                />
+              )}
+            />
+          </View>
+
+          <View className="-mx-1">
+            <Controller
+              name="hideFromTimeline"
+              control={form.control}
+              render={({ field: { onChange, value } }) => (
+                <FormSwitch
+                  value={value}
+                  label={t("subscription_form.hide_from_timeline")}
+                  labelAccessory={
+                    <PaidBadge
+                      feature={t("subscription_form.hide_from_timeline")}
+                      locked={isPlanLocked}
+                    />
+                  }
+                  description={t("subscription_form.hide_from_timeline_description")}
+                  onValueChange={onChange}
+                  disabled={isPlanLocked && subscription?.hideFromTimeline !== true}
+                  size="sm"
+                />
+              )}
+            />
+          </View>
+        </FormProvider>
+      </GroupedInsetListCard>
+    </SafeNavigationScrollView>
+  )
+}
+const styles = StyleSheet.create({
+  title: {
+    fontSize: 24,
+  },
+})
